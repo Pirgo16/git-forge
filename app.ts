@@ -33,6 +33,7 @@ import {
   putContent,
   requireRepo,
   userJson,
+  VIEWER,
   type Reply,
   type Repo,
 } from './store.ts';
@@ -140,13 +141,16 @@ function gitRoute(path: string): { owner: string; repo: string; rest: string } |
   };
 }
 
-function gitHeaders(kind: string, length: number): Record<string, string | number> {
-  return {
-    'content-type': kind,
-    'content-length': length,
-    'cache-control': 'no-cache',
-    'x-github-request-id': RID,
-  };
+const NO_QUERY: Record<string, string> = {};
+const UPLOAD_ADV = { 'content-type': 'application/x-git-upload-pack-advertisement', 'content-length': 0, 'cache-control': 'no-cache', 'x-github-request-id': RID };
+const RECV_ADV = { 'content-type': 'application/x-git-receive-pack-advertisement', 'content-length': 0, 'cache-control': 'no-cache', 'x-github-request-id': RID };
+const UPLOAD_RES = { 'content-type': 'application/x-git-upload-pack-result', 'content-length': 0, 'cache-control': 'no-cache', 'x-github-request-id': RID };
+const RECV_RES = { 'content-type': 'application/x-git-receive-pack-result', 'content-length': 0, 'cache-control': 'no-cache', 'x-github-request-id': RID };
+
+function endGit(res: ServerResponse, headers: { 'content-length': number }, body: Buffer): void {
+  headers['content-length'] = body.length;
+  res.writeHead(200, headers);
+  res.end(body);
 }
 
 function serveGit(req: IncomingMessage, res: ServerResponse, path: string, query: Record<string, string>): boolean {
@@ -169,11 +173,7 @@ function serveGit(req: IncomingMessage, res: ServerResponse, path: string, query
       send(res, 404, { message: 'Not Found' });
       return true;
     }
-    const type = service === 'git-receive-pack'
-      ? 'application/x-git-receive-pack-advertisement'
-      : 'application/x-git-upload-pack-advertisement';
-    res.writeHead(200, gitHeaders(type, body.length));
-    res.end(body);
+    endGit(res, service === 'git-receive-pack' ? RECV_ADV : UPLOAD_ADV, body);
     return true;
   }
   if (req.method === 'POST' && (route.rest === '/git-upload-pack' || route.rest === '/git-receive-pack')) {
@@ -181,11 +181,7 @@ function serveGit(req: IncomingMessage, res: ServerResponse, path: string, query
       .then((buf) => {
         const upload = route.rest === '/git-upload-pack';
         const body = upload ? uploadPack(repo.git, buf) : receivePack(repo.git, buf);
-        const type = upload ? 'application/x-git-upload-pack-result' : 'application/x-git-receive-pack-result';
-        if (!res.headersSent) {
-          res.writeHead(200, gitHeaders(type, body.length));
-          res.end(body);
-        }
+        if (!res.headersSent) endGit(res, upload ? UPLOAD_RES : RECV_RES, body);
       })
       .catch(() => {
         if (!res.headersSent) send(res, 400, { message: 'Bad git request' });
@@ -193,6 +189,43 @@ function serveGit(req: IncomingMessage, res: ServerResponse, path: string, query
     return true;
   }
   return false;
+}
+
+function fastIssue(req: IncomingMessage, res: ServerResponse, url: string): boolean {
+  if (req.method !== 'POST' || !url.startsWith('/api/v3/repos/') || !url.endsWith('/issues')) return false;
+  const mid = url.slice('/api/v3/repos/'.length, -'/issues'.length);
+  const slash = mid.indexOf('/');
+  if (slash <= 0 || mid.indexOf('/', slash + 1) !== -1 || mid.indexOf('%') !== -1) return false;
+  if (!authed(req)) {
+    unauth(res);
+    return true;
+  }
+  const owner = mid.slice(0, slash);
+  const repoName = mid.slice(slash + 1);
+  if (owner !== VIEWER) {
+    send(res, 404, { message: 'Not Found' });
+    return true;
+  }
+  void readBody(req, 2 * 1024 * 1024)
+    .then((buf) => {
+      let value: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(buf.toString('utf8')) as unknown;
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          send(res, 400, { message: 'Problems parsing JSON' });
+          return;
+        }
+        value = parsed as Record<string, unknown>;
+      } catch {
+        send(res, 400, { message: 'Problems parsing JSON' });
+        return;
+      }
+      if (!res.headersSent) reply(res, createIssue(repoName, value.title, value.body, value.labels));
+    })
+    .catch(() => {
+      if (!res.headersSent) send(res, 400, { message: 'Problems parsing JSON' });
+    });
+  return true;
 }
 
 function num(part: string | undefined): number | null {
@@ -430,6 +463,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 export function createApp(): Server {
   const server = createServer((req, res) => {
     const url = req.url ?? '/';
+    if (fastIssue(req, res, url)) return;
+    if (url.indexOf('.git/') > 0) {
+      const q = url.indexOf('?');
+      const path = q < 0 ? url : url.slice(0, q);
+      if (serveGit(req, res, path, q < 0 ? NO_QUERY : queryOf(url.slice(q + 1)))) return;
+    }
     if (req.method === 'GET') {
       if (url === '/healthz') {
         const body = Buffer.from('{"ok":true}');
@@ -452,6 +491,7 @@ export function createApp(): Server {
       if (!res.headersSent) send(res, 500, { message: 'Internal Server Error' });
     });
   });
+  server.on('connection', (socket) => socket.setNoDelay(true));
   server.keepAliveTimeout = 65_000;
   server.headersTimeout = 70_000;
   server.requestTimeout = 0;

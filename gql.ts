@@ -16,6 +16,7 @@ import {
   mergePull,
   patchIssue,
 } from './store.ts';
+import { diffFiles } from './git.ts';
 
 const UNKNOWN = Symbol('unknown');
 
@@ -364,20 +365,8 @@ function pullField(obj: Record<string, unknown>, field: Field, vars: Record<stri
 }
 
 function diffFilesOf(repo: Repo, base: string, head: string): Record<string, unknown>[] {
-  const { diffFiles } = requireDiff();
   return diffFiles(repo.git, base, head).map((file) => ({ __typename: 'PullRequestChangedFile', path: file.filename }));
 }
-
-function requireDiff(): { diffFiles: typeof import('./git.ts').diffFiles } {
-  return { diffFiles: (git, base, head) => importDiff(git, base, head) };
-}
-
-function importDiff(git: Repo['git'], base: string, head: string): { filename: string }[] {
-  // Local import kept as a direct call via the binding below.
-  return diffFilesDirect(git, base, head);
-}
-
-import { diffFiles as diffFilesDirect } from './git.ts';
 
 function resolve(obj: Record<string, unknown>, field: Field, vars: Record<string, unknown>): unknown {
   switch (obj.__typename) {

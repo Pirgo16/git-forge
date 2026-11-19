@@ -24,6 +24,7 @@ export interface GitState {
   advRecv: Buffer | null;
   lsDefault: Buffer | null;
   shallow1: Map<string, Buffer>;
+  uploads: { body: Buffer; response: Buffer }[];
 }
 
 export function createGit(): GitState {
@@ -37,6 +38,7 @@ export function createGit(): GitState {
     advRecv: null,
     lsDefault: null,
     shallow1: new Map(),
+    uploads: [],
   };
 }
 
@@ -44,6 +46,7 @@ function touch(state: GitState): void {
   state.advV0 = null;
   state.advRecv = null;
   state.lsDefault = null;
+  state.uploads.length = 0;
 }
 
 const TYPE_NAME = ['', 'commit', 'tree', 'blob', 'tag'] as const;
@@ -821,6 +824,20 @@ function fetchV0(state: GitState, body: Buffer): Buffer {
 }
 
 export function uploadPack(state: GitState, body: Buffer): Buffer {
+  const slots = state.uploads;
+  for (let i = 0; i < slots.length; i += 1) {
+    const slot = slots[i]!;
+    if (slot.body.length === body.length && slot.body.equals(body)) return slot.response;
+  }
+  const response = answerUpload(state, body);
+  if (body.length <= 8192) {
+    if (slots.length === 4) slots.shift();
+    slots.push({ body, response });
+  }
+  return response;
+}
+
+function answerUpload(state: GitState, body: Buffer): Buffer {
   const head = body.subarray(0, Math.min(body.length, 80));
   const first = parsePkts(head, false);
   const data = first?.pkts.find((pktLine): pktLine is DataPkt => pktLine.kind === 'data');
